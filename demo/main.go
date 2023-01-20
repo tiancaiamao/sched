@@ -1,3 +1,4 @@
+// Copyright 2023 The sched Authors
 // Copyright 2021 The cpuworker Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +24,6 @@ import (
 
 	mathrand "math/rand"
 	"net/http"
-	// "runtime"
 	"context"
 	"time"
 
@@ -52,23 +52,22 @@ func cpuIntensiveTaskWithCheckpoint(ctx context.Context, amt int) uint32 {
 func handleChecksumWithoutScheduling(w http.ResponseWriter, _ *http.Request) {
 	ts := time.Now()
 	ck := cpuIntensiveTask(10000 + mathrand.Intn(10000))
-	w.Write([]byte(fmt.Sprintln("crc32 (without cpuworker):", ck, "time cost:", time.Now().Sub(ts))))
+	w.Write([]byte(fmt.Sprintln("crc32 (without scheduling):", ck, "time cost:", time.Now().Sub(ts))))
 }
 
 func handleChecksumWithScheduling(w http.ResponseWriter, _ *http.Request) {
 	ts := time.Now()
 	var ck uint32
-	tg := sched.NewTaskGroup()
-	ctx := sched.NewContext(context.Background(), tg)
+	ctx, _ := sched.NewTaskGroup(context.Background())
 	ck = cpuIntensiveTaskWithCheckpoint(ctx, 10000+mathrand.Intn(10000))
-	w.Write([]byte(fmt.Sprintln("crc32 (with cpuworker and checkpoint):", ck, "time cost:", time.Now().Sub(ts))))
+	w.Write([]byte(fmt.Sprintln("crc32 (with scheduling and checkpoint):", ck, "time cost:", time.Now().Sub(ts))))
 }
 
-func handleChecksumSmallTaskWithCpuWorker(w http.ResponseWriter, _ *http.Request) {
+func handleChecksumSmallTaskWithScheduling(w http.ResponseWriter, _ *http.Request) {
 	ts := time.Now()
 	var ck uint32
 	ck = cpuIntensiveTask(10)
-	w.Write([]byte(fmt.Sprintln("crc32 (with cpuworker and small task):", ck, "time cost:", time.Now().Sub(ts))))
+	w.Write([]byte(fmt.Sprintln("crc32 (with scheduilng and small task):", ck, "time cost:", time.Now().Sub(ts))))
 }
 
 func handleDelay(w http.ResponseWriter, _ *http.Request) {
@@ -97,9 +96,7 @@ func handleDelayLoop(w http.ResponseWriter, _ *http.Request) {
 	w.Write([]byte(fmt.Sprintf("delayed 1ms loop, final , total time cost %s :)\n", time.Now().Sub(t0))))
 }
 
-func handleDelayLoopWithCpuWorker(w http.ResponseWriter, _ *http.Request) {
-	// t0 := time.Now()
-	// for idx := range make([]byte, 10) {
+func handleDelayLoopWithScheduling(w http.ResponseWriter, _ *http.Request) {
 	for _ = range make([]byte, 10) {
 		// t0 := time.Now()
 		wCh := make(chan struct{})
@@ -107,14 +104,7 @@ func handleDelayLoopWithCpuWorker(w http.ResponseWriter, _ *http.Request) {
 			time.Sleep(time.Millisecond)
 			wCh <- struct{}{}
 		}()
-		// eventCall(func() {
-		// 	<-wCh
-		// 	w.Write([]byte(fmt.Sprintf("delayed 1ms loop with cpuworker, idx:%d , time cost %s :)\n", idx, time.Now().Sub(t0))))
-		// })
 	}
-	// eventCall(func() {
-	// 	w.Write([]byte(fmt.Sprintf("delayed 1ms loop with cpuworker, final , total time cost %s :)\n", time.Now().Sub(t0))))
-	// })
 }
 
 func main() {
@@ -122,10 +112,10 @@ func main() {
 	rand.Read(glCrc32bs)
 
 	http.HandleFunc("/checksumWithScheduling", handleChecksumWithScheduling)
-	http.HandleFunc("/checksumSmallTaskWithCpuWorker", handleChecksumSmallTaskWithCpuWorker)
+	http.HandleFunc("/checksumSmallTaskWithScheduling", handleChecksumSmallTaskWithScheduling)
 	http.HandleFunc("/checksumWithoutScheduling", handleChecksumWithoutScheduling)
 	http.HandleFunc("/delay1ms", handleDelay)
 	http.HandleFunc("/delay1msLoop", handleDelayLoop)
-	http.HandleFunc("/delay1msLoopWithCpuWorker", handleDelayLoopWithCpuWorker)
+	http.HandleFunc("/delay1msLoopWithScheduling", handleDelayLoopWithScheduling)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

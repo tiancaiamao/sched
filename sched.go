@@ -1,19 +1,22 @@
 package sched
 
 import (
+	"runtime"
 	"container/heap"
 	"context"
 	"sync"
 	"sync/atomic"
 	"time"
 	_ "unsafe"
+
+	_ "go.uber.org/automaxprocs"
 )
 
 type TaskGroup struct {
 	cpuTime   int64
 	startTime time.Time
 
-	// All tasks in this task group is yield and maintained in a link list
+	// All task context (goroutine) in this task group is yield and maintained in a link list
 	mu struct {
 		sync.RWMutex
 		tasks *TaskContext
@@ -23,23 +26,16 @@ type TaskGroup struct {
 type TaskContext struct {
 	tg *TaskGroup
 	wg sync.WaitGroup
-
 	lastCheck int64
 	next      *TaskContext
 }
 
-type key int
+type keyType int
 
-const Key key = 0
-
-func NewTaskGroup() *TaskGroup {
-	return &TaskGroup{
-		startTime: time.Now(),
-	}
-}
+const key keyType = 0
 
 func fromContext(ctx context.Context) *TaskContext {
-	val := ctx.Value(Key)
+	val := ctx.Value(key)
 	if val == nil {
 		return nil
 	}
@@ -50,20 +46,35 @@ func fromContext(ctx context.Context) *TaskContext {
 	return ret
 }
 
-func NewContext(ctx context.Context, tg *TaskGroup) context.Context {
-	return context.WithValue(ctx, Key, &TaskContext{
+// NewTaskGroup returns a new context with TaskGroup attached using context.WithValue.
+// A task group is a scheduling unit consist of a group of goroutines.
+// The necessary information for scheduling is embeded in the context.Context.
+func NewTaskGroup(ctx context.Context) (context.Context, *TaskGroup) {
+	tg := &TaskGroup{
+		startTime: time.Now(),
+	}
+	return context.WithValue(ctx, key, &TaskContext{
 		tg: tg,
-	})
+	}), tg
 }
 
-func ContextWithSchedInfo(ctx context.Context) context.Context {
+// WithSchedInfo returns a new context with scheduling information attached.
+// When creating running a new goroutine from a task group, use this:
+//     ctx := WithSchedInfo(ctx)
+//     go subTask(ctx)
+func WithSchedInfo(ctx context.Context) context.Context {
 	tc := fromContext(ctx)
 	if tc == nil {
 		panic("no TaskContext found in current context!")
 	}
-	return NewContext(ctx, tc.tg)
+	return context.WithValue(ctx, key, &TaskContext{
+		tg: tc.tg,
+	})
 }
 
+// CheckPoint should be called manually to check whether the goroutine (task group)
+// run out of its time slice. If so, the goroutine is yielded for scheduling.
+// The scheduler will wake up it according to the scheduling algorithm.
 func CheckPoint(ctx context.Context) {
 	tc := fromContext(ctx)
 	if tc == nil {
@@ -80,7 +91,7 @@ func CheckPoint(ctx context.Context) {
 		elapse := runningTime - tc.lastCheck
 		tc.lastCheck = runningTime
 		cpuTime := atomic.AddInt64(&tg.cpuTime, elapse)
-		if time.Duration(cpuTime) < 20*time.Millisecond {
+		if time.Duration(cpuTime) < s.cfg.timeSlice {
 			return
 		}
 	}
@@ -90,21 +101,45 @@ func CheckPoint(ctx context.Context) {
 	tc.wg.Wait()
 }
 
+type config struct {
+	timeSlice time.Duration
+	load float64
+	capacity time.Duration
+}
+
 type sched struct {
+	cfg config
 	ch chan *TaskContext
 	pq *PriorityQueue
 }
 
-var s = sched{
-	ch: make(chan *TaskContext, 4096),
-	pq: newPriorityQueue(200),
+var s = sched {
+	ch: make(chan *TaskContext, 8192),
+	pq: newPriorityQueue(1024),
+	cfg: config{
+		timeSlice: 20 * time.Millisecond,
+		load: 0.8,
+	},
 }
 
-func Scheduler() {
-	lastTime := time.Now()
-	const rate = 10
-	capacity := 200 * time.Millisecond
+// Option overrides the default scheduling parameters.
+type Option func(*config)
+
+// Scheduler should run in a separate goroutine, and typically be called at the beginning of the process.
+func Scheduler(opts ...Option) {
+	numCPU := runtime.GOMAXPROCS(0)
+	for _, opt := range opts {
+		opt(&s.cfg)
+	}
+	timeSlice := s.cfg.timeSlice
+	rate := s.cfg.load * float64(numCPU)
+	capacity := s.cfg.capacity
+	if capacity == 0 {
+		capacity = timeSlice * time.Duration(numCPU)
+	}
+
 	tokens := capacity
+	lastTime := time.Now()
 	for {
 		select {
 		case cp := <-s.ch:
@@ -138,7 +173,7 @@ func Scheduler() {
 		lastTime = now
 
 		// refill tokens
-		tokens += rate * elapse
+		tokens += time.Duration(rate * float64(elapse))
 		if tokens > capacity {
 			tokens = capacity
 		}
@@ -155,13 +190,13 @@ func Scheduler() {
 		// So we reach a conclusion that the smaller the start running time of a task group, the less CPU resource it uses, thus the higher priority.
 
 		for !s.pq.Empty() {
-			if tokens < 20*time.Millisecond {
+			if tokens < timeSlice {
 				// Not enough tokens, rate limiter take effect.
 				break
 			}
 
 			tg := s.pq.Dequeue()
-			tokens -= 20 * time.Millisecond
+			tokens -= timeSlice
 			tg.startTime = now
 			atomic.StoreInt64(&tg.cpuTime, 0)
 			tg.mu.Lock()
@@ -173,6 +208,29 @@ func Scheduler() {
 			}
 			tg.mu.Unlock()
 		}
+	}
+}
+
+// TimeSliceOption controls the time-slice of a task group.
+// It's default to 20ms
+func TimeSliceOption(v time.Duration) Option {
+	return func(c *config) {
+		c.timeSlice = v
+	}
+}
+
+// LoadOption controls the `load` of the CPU usage, default to 0.8 (80%)
+func LoadOption(v float64) Option {
+	return func(c *config) {
+		c.load = v
+	}
+}
+
+// CapacityOption controls the token bucket capacity, which controls the burst behaviour.
+// Default value is GOMAXPROCS * time slice, DONOT SET IT TO 0
+func CapacityOption(v time.Duration) Option {
+	return func(c *config) {
+		c.capacity = v
 	}
 }
 
@@ -232,3 +290,4 @@ func (pq *PriorityQueue) Empty() bool {
 
 //go:linkname grunningnanos runtime.grunningnanos
 func grunningnanos() int64
+
