@@ -2,6 +2,7 @@ package sched
 
 import (
 	"runtime"
+	"runtime/debug"
 	"container/heap"
 	"context"
 	"sync"
@@ -34,6 +35,8 @@ type keyType int
 
 const key keyType = 0
 
+var Debug = "schedTest"
+
 func fromContext(ctx context.Context) *TaskContext {
 	val := ctx.Value(key)
 	if val == nil {
@@ -44,6 +47,10 @@ func fromContext(ctx context.Context) *TaskContext {
 		return nil
 	}
 	return ret
+}
+
+func FromContext(ctx context.Context) *TaskContext {
+	return fromContext(ctx)
 }
 
 // NewTaskGroup returns a new context with TaskGroup attached using context.WithValue.
@@ -65,19 +72,39 @@ func NewTaskGroup(ctx context.Context) (context.Context, *TaskGroup) {
 func WithSchedInfo(ctx context.Context) context.Context {
 	tc := fromContext(ctx)
 	if tc == nil {
-		panic("no TaskContext found in current context!")
+		if x := ctx.Value(Debug); x != nil {
+			debug.PrintStack()
+		}
+		return ctx
 	}
 	return context.WithValue(ctx, key, &TaskContext{
 		tg: tc.tg,
 	})
 }
 
+// Go runs f in a separate goroutine. It's the same with:
+//     ctx := WithSchedInfo(ctx)
+//     go f(ctx)
+// It's recommended to use this API rather than do above steps manually,
+// because one may forget to call WithSchedInfo.
+func Go(ctx context.Context, f func(ctx context.Context)) {
+	ctx = WithSchedInfo(ctx)
+	go f(ctx)
+}
+
 // CheckPoint should be called manually to check whether the goroutine (task group)
 // run out of its time slice. If so, the goroutine is yielded for scheduling.
 // The scheduler will wake up it according to the scheduling algorithm.
 func CheckPoint(ctx context.Context) {
+	if s.disabled.Load() == true {
+		return
+	}
+
 	tc := fromContext(ctx)
 	if tc == nil {
+		if x := ctx.Value(Debug); x != nil {
+			debug.PrintStack()
+		}
 		return
 	}
 
@@ -111,6 +138,7 @@ type sched struct {
 	cfg config
 	ch chan *TaskContext
 	pq *PriorityQueue
+	disabled    atomic.Bool
 }
 
 var s = sched {
@@ -120,6 +148,16 @@ var s = sched {
 		timeSlice: 20 * time.Millisecond,
 		load: 0.8,
 	},
+}
+
+// Enable is provided for debugging.
+func Enable() {
+	s.disabled.Store(false)
+}
+
+// Disable is provided for debugging.
+func Disable() {
+	s.disabled.Store(true)
 }
 
 // Option overrides the default scheduling parameters.
@@ -135,9 +173,11 @@ func Scheduler(opts ...Option) {
 	rate := s.cfg.load * float64(numCPU)
 	capacity := s.cfg.capacity
 	if capacity == 0 {
-		capacity = timeSlice * time.Duration(numCPU)
+		// capacity = timeSlice * time.Duration(numCPU)
+		capacity = time.Duration(float64(timeSlice) * rate)
 	}
 
+	ticker := time.NewTicker(timeSlice)
 	tokens := capacity
 	lastTime := time.Now()
 	for {
@@ -151,6 +191,8 @@ func Scheduler(opts ...Option) {
 			cp.next = tg.mu.tasks
 			tg.mu.tasks = cp
 			tg.mu.Unlock()
+		case <-ticker.C:
+			// in case of bug?
 		}
 
 		// A token bucket algorithm to limit the total cpu usage.
@@ -174,6 +216,7 @@ func Scheduler(opts ...Option) {
 
 		// refill tokens
 		tokens += time.Duration(rate * float64(elapse))
+		// fmt.Println("tokens ==", tokens, "elapse:", elapse)
 		if tokens > capacity {
 			tokens = capacity
 		}
@@ -192,6 +235,7 @@ func Scheduler(opts ...Option) {
 		for !s.pq.Empty() {
 			if tokens < timeSlice {
 				// Not enough tokens, rate limiter take effect.
+				// fmt.Println("sched really take effect", s.pq.Len())
 				break
 			}
 

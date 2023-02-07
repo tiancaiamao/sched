@@ -9,12 +9,11 @@ import (
 func TestExample(t *testing.T) {
 	go Scheduler()
 
-	tg := &TaskGroup{}
-	ctx := NewContext(context.Background(), tg)
+	ctx, _ := NewTaskGroup(context.Background())
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	ctx1 := ContextWithSchedInfo(ctx)
+	ctx1 := WithSchedInfo(ctx)
 	go func(ctx context.Context) {
 		for x := 0; x < 100; x++ {
 			for i := 0; i < 10000000; i++ {
