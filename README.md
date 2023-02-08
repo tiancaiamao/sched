@@ -8,7 +8,11 @@ See a blog post (Chinese) https://www.zenlife.tk/go-manual-scheduler.md
 
 Need to patch the Go https://github.com/golang/go/pull/51347
 
-## Run the Demo
+## Watch the Demo
+
+[![asciicast](https://asciinema.org/a/558157.svg)](https://asciinema.org/a/558157?t=02:25&speed=2)
+
+## Run it yourself
 
 Run the [demo/main.go](demo/main.go).
 
