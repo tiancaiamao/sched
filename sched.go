@@ -1,6 +1,8 @@
 package sched
 
 import (
+	"fmt"
+	"syscall"
 	"runtime"
 	"runtime/debug"
 	"container/heap"
@@ -113,14 +115,13 @@ func CheckPoint(ctx context.Context) {
 	scheduling := tg.mu.tasks != nil
 	tg.mu.RUnlock()
 
-	if !scheduling {
-		runningTime := grunningnanos()
-		elapse := runningTime - tc.lastCheck
-		tc.lastCheck = runningTime
-		cpuTime := atomic.AddInt64(&tg.cpuTime, elapse)
-		if time.Duration(cpuTime) < s.cfg.timeSlice {
-			return
-		}
+	runningTime := grunningnanos()
+	elapse := runningTime - tc.lastCheck
+	tc.lastCheck = runningTime
+	cpuTime := atomic.AddInt64(&tg.cpuTime, elapse)
+
+	if !scheduling && time.Duration(cpuTime) < s.cfg.timeSlice {
+		return
 	}
 
 	tc.wg.Add(1)
@@ -137,12 +138,14 @@ type config struct {
 type sched struct {
 	cfg config
 	ch chan *TaskContext
+	refillCh chan time.Duration
 	pq *PriorityQueue
 	disabled    atomic.Bool
 }
 
 var s = sched {
 	ch: make(chan *TaskContext, 8192),
+	refillCh: make(chan time.Duration, 100),
 	pq: newPriorityQueue(1024),
 	cfg: config{
 		timeSlice: 20 * time.Millisecond,
@@ -170,16 +173,16 @@ func Scheduler(opts ...Option) {
 		opt(&s.cfg)
 	}
 	timeSlice := s.cfg.timeSlice
-	rate := s.cfg.load * float64(numCPU)
 	capacity := s.cfg.capacity
 	if capacity == 0 {
-		// capacity = timeSlice * time.Duration(numCPU)
-		capacity = time.Duration(float64(timeSlice) * rate)
+		capacity = timeSlice * time.Duration(numCPU)
+		// capacity = time.Duration(float64(timeSlice) * rate)
 	}
 
-	ticker := time.NewTicker(timeSlice)
+	fmt.Println("numCPU=", numCPU, "load=", s.cfg.load, "capacity=", capacity, "timeSlice=", timeSlice)
+	go refillTokensByLoad(s.refillCh, timeSlice, s.cfg.load * float64(numCPU))
+
 	tokens := capacity
-	lastTime := time.Now()
 	for {
 		select {
 		case cp := <-s.ch:
@@ -191,35 +194,16 @@ func Scheduler(opts ...Option) {
 			cp.next = tg.mu.tasks
 			tg.mu.tasks = cp
 			tg.mu.Unlock()
-		case <-ticker.C:
-			// in case of bug?
+		case refill := <-s.refillCh:
+			tokens += refill
+			if tokens > capacity {
+				tokens = capacity
+			}
+			if tokens < 0 {
+				tokens = 0
+			}
 		}
 
-		// A token bucket algorithm to limit the total cpu usage.
-		//
-		// When a task group enqueue, it means a 20ms cpu time elapsed,
-		// assume that the elapsed wall time is 100ms, it means the CPU usage is 20ms/100ms = 20%
-		// assume that the elapsed wall time is 20ms, it means the CPU usage is 20ms/20ms = 100%
-		// assume that the elapsed wall time is 5ms, it means the CPU usage is 20ms/5ms = 400%
-		// The last case can happen in a multi-core environment.
-		//
-		// == How to decide the token generate rate? ==
-		// Say, we want to control the CPU usage at 80%, there are 10 cores.
-		// GC takes 25% of CPU resource, reserve that for it, we have actually 750% available in total.
-		// 750% * 80% = 600%
-		// CPU usage = cpu time / wall time, so the rate is: every 100ms, we can have 600ms cpu time,
-		// 600ms / 20ms = 30, or we can say: every 100ms, we can have 30 token generated.
-
-		now := time.Now()
-		elapse := now.Sub(lastTime)
-		lastTime = now
-
-		// refill tokens
-		tokens += time.Duration(rate * float64(elapse))
-		// fmt.Println("tokens ==", tokens, "elapse:", elapse)
-		if tokens > capacity {
-			tokens = capacity
-		}
 
 		// == How to decide the priority of a task group? ==
 		// If a task group A is swap-in to the queue, and its last running time is [startA, endA], the corresponding cpu time is 20ms.
@@ -234,14 +218,14 @@ func Scheduler(opts ...Option) {
 
 		for !s.pq.Empty() {
 			if tokens < timeSlice {
-				// Not enough tokens, rate limiter take effect.
-				// fmt.Println("sched really take effect", s.pq.Len())
+				// fmt.Println("sched really take effect", s.pq.Len(), "token:", tokens)
 				break
 			}
 
 			tg := s.pq.Dequeue()
-			tokens -= timeSlice
-			tg.startTime = now
+			cpuTime := time.Duration(atomic.LoadInt64(&tg.cpuTime))
+			tokens -= cpuTime
+			tg.startTime = time.Now()
 			atomic.StoreInt64(&tg.cpuTime, 0)
 			tg.mu.Lock()
 			for tg.mu.tasks != nil {
@@ -253,6 +237,92 @@ func Scheduler(opts ...Option) {
 			tg.mu.Unlock()
 		}
 	}
+}
+
+func refillTokensByLoad(refillCh chan<- time.Duration, timeSlice time.Duration, load float64) {
+	// A token bucket algorithm to limit the total cpu usage.
+	//
+	// When a task group enqueue, it means a 20ms cpu time elapsed,
+	// assume that the elapsed wall time is 100ms, it means the CPU usage is 20ms/100ms = 20%
+	// assume that the elapsed wall time is 20ms, it means the CPU usage is 20ms/20ms = 100%
+	// assume that the elapsed wall time is 5ms, it means the CPU usage is 20ms/5ms = 400%
+	// The last case can happen in a multi-core environment.
+	//
+	// == How to decide the token generate rate? ==
+	// Say, we want to control the CPU usage at 80%, there are 10 cores.
+	// GC takes 25% of CPU resource, reserve that for it, we have actually 750% available in total.
+	// 750% * 80% = 600%
+	// CPU usage = cpu time / wall time, so the rate is: every 100ms, we can have 600ms cpu time,
+	// 600ms / 20ms = 30, or we can say: every 100ms, we can have 30 token generated.
+
+	lastWallClock := time.Now()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	lastSys, lastUsr := getProcessCPUTime()
+	totalReal, totalExpect := time.Duration(0), time.Duration(0)
+	expect := 10 * time.Millisecond
+	capacity := 10 * time.Duration(float64(time.Millisecond) * load)
+	for i := 0; ; i++ {
+		now := <-ticker.C
+		sys,usr := getProcessCPUTime()
+		s := sys.Sub(lastSys)
+		u := usr.Sub(lastUsr)
+		lastSys = sys
+		lastUsr = usr
+		real := s + u
+
+		elapse := now.Sub(lastWallClock)
+		lastWallClock = now
+
+		max := time.Duration(float64(elapse) * load)
+		// expect := time.Duration(float64(elapse) * load)
+
+		totalReal += real
+		totalExpect += max
+		
+		delta := max - real
+		_ = delta
+		// refillCh <- delta
+		// refillCh <- time.Duration(float64(delta) * 0.5) + time.Duration(float64(expect) * 0.5)
+		// refillCh <- time.Duration(float64(delta) * 0.4) + time.Duration(float64(expect) * 0.6)
+		// refillCh <- time.Duration(float64(delta) * 0.25) + time.Duration(float64(expect) * 0.75)
+		// refillCh <- expect
+
+		if delta < 0 {
+			// expect = time.Duration(1.8 * float64(delta)) + expect
+			// refillCh <- time.Duration(1.8 * float64(delta)) + expect
+			// expect = time.Duration(1.5 * float64(delta)) + expect
+			// expect = time.Duration(1.2 * float64(delta)) + expect
+			expect += delta
+		} else {
+			expect += delta
+		}
+		if expect >= capacity {
+			expect = capacity
+		}
+
+		if expect < 0 {
+			fmt.Println("expect:", expect, "delta:", delta, "max:", max, "real:", real, "sys:", s, "usr:", u)
+		}
+
+		refillCh  <- expect
+
+		if i % 100 == 0 {
+			fmt.Println("totalReal:", totalReal, "totalExpect:", totalExpect)
+			totalReal = 0
+			totalExpect = 0
+		}
+	}
+}
+
+func getProcessCPUTime() (time.Time, time.Time) {
+	var r syscall.Rusage
+	err := syscall.Getrusage(syscall.RUSAGE_SELF, &r)
+	if err != nil {
+		panic(err)
+	}
+	sys := time.Unix(r.Stime.Sec, r.Stime.Usec*1000)
+	usr := time.Unix(r.Utime.Sec, r.Utime.Usec*1000)
+	return sys, usr
 }
 
 // TimeSliceOption controls the time-slice of a task group.
@@ -314,6 +384,11 @@ func (pq *PriorityQueue) Pop() interface{} {
 	ret := pq.data[n-1]
 	pq.data = pq.data[: n-1 : cap(pq.data)]
 	return ret
+}
+
+func (pq *PriorityQueue) Peek() *TaskGroup {
+	n := len(pq.data)
+	return pq.data[n-1]
 }
 
 func (pq *PriorityQueue) Enqueue(x *TaskGroup) {
