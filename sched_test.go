@@ -1,20 +1,20 @@
 package sched
 
 import (
+	"context"
+	"fmt"
+	"hash/crc32"
+	"io/ioutil"
+	"math/rand"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strconv"
-	"io/ioutil"
 	"strings"
-	"syscall"
-	"fmt"
-	"time"
-	"hash/crc32"
-	"context"
 	"sync"
+	"syscall"
 	"testing"
-	"math/rand"
-	_ "net/http/pprof"
-	"net/http"
+	"time"
 )
 
 func TestExample(t *testing.T) {
@@ -42,11 +42,10 @@ func TestExample(t *testing.T) {
 func f(i int) {
 }
 
-
 var glCrc32bs = make([]byte, 1024*256)
 
 func cpuIntensiveTask(ctx context.Context) uint32 {
-	amt := 10000+rand.Intn(10000)
+	amt := 10000 + rand.Intn(10000)
 	var ck uint32
 	for range make([]struct{}, amt) {
 		ck = crc32.ChecksumIEEE(glCrc32bs)
@@ -58,12 +57,12 @@ func cpuIntensiveTask(ctx context.Context) uint32 {
 func allocIntensiveTask(m map[int][]byte, ctx context.Context) {
 	// m := make(map[int][]byte)
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	for i:=0; i<100000; i++ {
+	for i := 0; i < 100000; i++ {
 		idx := r.Intn(4000000)
 		sz := 8 + r.Intn(248)
 		m[idx] = make([]byte, sz)
 
-		if i % 20 == 0 {
+		if i%20 == 0 {
 			CheckPoint(ctx)
 		}
 	}
@@ -71,11 +70,10 @@ func allocIntensiveTask(m map[int][]byte, ctx context.Context) {
 
 func TestT(t *testing.T) {
 	// go Scheduler(LoadOption(0.50), TimeSliceOption(10*time.Millisecond))
-	fmt.Println("33333333333333333444")
-	go Scheduler(LoadOption(0.9), TimeSliceOption(10*time.Millisecond))
-	for i:=0; i<12; i++ {
+	go Scheduler(LoadOption(0.8), TimeSliceOption(10*time.Millisecond))
+	for i := 0; i < 12; i++ {
 		ctx, _ := NewTaskGroup(context.Background())
-		switch i%3 {
+		switch i % 3 {
 		case 0:
 			Go(ctx, func(ctx context.Context) {
 				for {
@@ -106,7 +104,7 @@ var g = 33
 
 func untracked() {
 	for {
-		for i:=0; i<1000; i++ {
+		for i := 0; i < 1000; i++ {
 			g += i
 		}
 	}
@@ -115,10 +113,10 @@ func untracked() {
 func TestX(t *testing.T) {
 	var r syscall.Rusage
 
-	for i:=0; i<5; i++ {
+	for i := 0; i < 5; i++ {
 		go func() {
 			for {
-				amt := 10000+rand.Intn(10000)
+				amt := 10000 + rand.Intn(10000)
 				for range make([]struct{}, amt) {
 					crc32.ChecksumIEEE(glCrc32bs)
 				}
@@ -147,7 +145,7 @@ func TestX(t *testing.T) {
 func BenchmarkGetrsusage(b *testing.B) {
 	var r syscall.Rusage
 	b.ResetTimer()
-	for i:=0; i< b.N; i++ {
+	for i := 0; i < b.N; i++ {
 		err := syscall.Getrusage(syscall.RUSAGE_SELF, &r)
 		if err != nil {
 			panic(err)
@@ -158,7 +156,7 @@ func BenchmarkGetrsusage(b *testing.B) {
 // BenchmarkGetCPUTime-16            144364              8238 ns/op            2097 B/op          9 allocs/op
 func BenchmarkGetCPUTime(b *testing.B) {
 	b.ResetTimer()
-	for i:=0; i< b.N; i++ {
+	for i := 0; i < b.N; i++ {
 		_, _, err := getCPUTime()
 		if err != nil {
 			panic(err)
@@ -171,7 +169,7 @@ func BenchmarkReadFile(b *testing.B) {
 	pid := os.Getpid()
 	path := fmt.Sprintf("/proc/%d/stat", pid)
 	b.ResetTimer()
-	for i:=0; i< b.N; i++ {
+	for i := 0; i < b.N; i++ {
 		_, err := ioutil.ReadFile(path)
 		if err != nil {
 			panic(err)

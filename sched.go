@@ -1,14 +1,14 @@
 package sched
 
 import (
-	"fmt"
-	"syscall"
-	"runtime"
-	"runtime/debug"
 	"container/heap"
 	"context"
+	// "fmt"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	_ "unsafe"
 
@@ -24,13 +24,15 @@ type TaskGroup struct {
 		sync.RWMutex
 		tasks *TaskContext
 	}
+	version uint64
 }
 
 type TaskContext struct {
-	tg *TaskGroup
-	wg sync.WaitGroup
+	tg        *TaskGroup
+	wg        sync.WaitGroup
 	lastCheck int64
 	next      *TaskContext
+	version   uint64
 }
 
 type keyType int
@@ -51,10 +53,6 @@ func fromContext(ctx context.Context) *TaskContext {
 	return ret
 }
 
-func FromContext(ctx context.Context) *TaskContext {
-	return fromContext(ctx)
-}
-
 // NewTaskGroup returns a new context with TaskGroup attached using context.WithValue.
 // A task group is a scheduling unit consist of a group of goroutines.
 // The necessary information for scheduling is embeded in the context.Context.
@@ -69,8 +67,9 @@ func NewTaskGroup(ctx context.Context) (context.Context, *TaskGroup) {
 
 // WithSchedInfo returns a new context with scheduling information attached.
 // When creating running a new goroutine from a task group, use this:
-//     ctx := WithSchedInfo(ctx)
-//     go subTask(ctx)
+//
+//	ctx := WithSchedInfo(ctx)
+//	go subTask(ctx)
 func WithSchedInfo(ctx context.Context) context.Context {
 	tc := fromContext(ctx)
 	if tc == nil {
@@ -85,8 +84,10 @@ func WithSchedInfo(ctx context.Context) context.Context {
 }
 
 // Go runs f in a separate goroutine. It's the same with:
-//     ctx := WithSchedInfo(ctx)
-//     go f(ctx)
+//
+//	ctx := WithSchedInfo(ctx)
+//	go f(ctx)
+//
 // It's recommended to use this API rather than do above steps manually,
 // because one may forget to call WithSchedInfo.
 func Go(ctx context.Context, f func(ctx context.Context)) {
@@ -115,13 +116,14 @@ func CheckPoint(ctx context.Context) {
 	scheduling := tg.mu.tasks != nil
 	tg.mu.RUnlock()
 
-	runningTime := grunningnanos()
-	elapse := runningTime - tc.lastCheck
-	tc.lastCheck = runningTime
-	cpuTime := atomic.AddInt64(&tg.cpuTime, elapse)
-
-	if !scheduling && time.Duration(cpuTime) < s.cfg.timeSlice {
-		return
+	if !scheduling {
+		runningTime := grunningnanos()
+		elapse := runningTime - tc.lastCheck
+		tc.lastCheck = runningTime
+		cpuTime := atomic.AddInt64(&tg.cpuTime, elapse)
+		if time.Duration(cpuTime) < s.cfg.timeSlice {
+			return
+		}
 	}
 
 	tc.wg.Add(1)
@@ -131,25 +133,25 @@ func CheckPoint(ctx context.Context) {
 
 type config struct {
 	timeSlice time.Duration
-	load float64
-	capacity time.Duration
+	load      float64
+	capacity  time.Duration
 }
 
 type sched struct {
-	cfg config
-	ch chan *TaskContext
-	refillCh chan time.Duration
-	pq *PriorityQueue
-	disabled    atomic.Bool
+	cfg        config
+	ch         chan *TaskContext
+	feedbackCh chan feedback
+	pq         *PriorityQueue
+	disabled   atomic.Bool
 }
 
-var s = sched {
-	ch: make(chan *TaskContext, 8192),
-	refillCh: make(chan time.Duration, 100),
-	pq: newPriorityQueue(1024),
+var s = sched{
+	ch:         make(chan *TaskContext, 8192),
+	feedbackCh: make(chan feedback, 100),
+	pq:         newPriorityQueue(1024),
 	cfg: config{
-		timeSlice: 20 * time.Millisecond,
-		load: 0.8,
+		timeSlice: 10 * time.Millisecond,
+		load:      0.8,
 	},
 }
 
@@ -176,34 +178,89 @@ func Scheduler(opts ...Option) {
 	capacity := s.cfg.capacity
 	if capacity == 0 {
 		capacity = timeSlice * time.Duration(numCPU)
-		// capacity = time.Duration(float64(timeSlice) * rate)
 	}
 
-	fmt.Println("numCPU=", numCPU, "load=", s.cfg.load, "capacity=", capacity, "timeSlice=", timeSlice)
-	go refillTokensByLoad(s.refillCh, timeSlice, s.cfg.load * float64(numCPU))
+	// monitor the current CPU load to adjust the rate.
+	initRate := s.cfg.load * float64(numCPU)
+	go cpuLoadFeedback(s.feedbackCh, initRate)
 
+	var output time.Duration
+
+	rate := initRate
 	tokens := capacity
-	for {
+	lastTime := time.Now()
+	for i := 0; ; {
 		select {
-		case cp := <-s.ch:
-			tg := cp.tg
+		case tc := <-s.ch:
+			tg := tc.tg
 			tg.mu.Lock()
 			if tg.mu.tasks == nil {
+				if tc.version < tg.version {
+					tc.version = tg.version
+					tc.wg.Done()
+					tg.mu.Unlock()
+					continue
+				}
+
 				s.pq.Enqueue(tg)
+				// fmt.Printf("!! enqueue by goroutine %p task group= %p, tc vec=%d, tg ver=%d\n", tc, tg, tc.version, tg.version)
+			} else {
+				// fmt.Printf("?? not enqueue, goroutine %p task group= %p, tc vec=%d, tg ver=%d\n", tc, tg, tc.version, tg.version)
 			}
-			cp.next = tg.mu.tasks
-			tg.mu.tasks = cp
+			tc.next = tg.mu.tasks
+			tg.mu.tasks = tc
 			tg.mu.Unlock()
-		case refill := <-s.refillCh:
-			tokens += refill
-			if tokens > capacity {
-				tokens = capacity
+		case fb := <-s.feedbackCh:
+			// The expected cpu time = load * numCPU * elapsed wall clock
+			expectCPUTime := initRate * float64(fb.elapse)
+			// delta is the difference between expected cpu time and actual cpu time
+			// delta can be a positive or a negative, positive means the CPU utilization is underloaded
+			// negative means the CPU utilization is overload
+			delta := expectCPUTime - float64(fb.cpuTime)
+			// delta / the period is used as feedback for the rate.
+			rateDelta := float64(delta) / float64(fb.elapse+10*time.Millisecond)
+			rate += rateDelta
+			i++
+			if i%100 == 0 {
+				// fmt.Println("rate:", rate, "tokens:", tokens, "initRate:", initRate, "output:", output)
+				output = 0
 			}
-			if tokens < 0 {
-				tokens = 0
+			// set a upper bound for the rate
+			// If there is no upper bound for the rate, it goes to +INF when the workload can't
+			// make the CPU utilization full. And +INF for rate does not make sense in that case.
+			if rate > 2*initRate {
+				rate = 2 * initRate
+			}
+			if rate < 0 {
+				rate = 0
 			}
 		}
 
+		// A token bucket algorithm to limit the total cpu usage.
+		//
+		// When a task group enqueue, it means a 20ms cpu time elapsed,
+		// assume that the elapsed wall time is 100ms, it means the CPU usage is 20ms/100ms = 20%
+		// assume that the elapsed wall time is 20ms, it means the CPU usage is 20ms/20ms = 100%
+		// assume that the elapsed wall time is 5ms, it means the CPU usage is 20ms/5ms = 400%
+		// The last case can happen in a multi-core environment.
+		//
+		// == How to decide the token generate rate? ==
+		// Say, we want to control the CPU usage at 80%, there are 10 cores.
+		// GC takes 25% of CPU resource, reserve that for it, we have actually 750% available in total.
+		// 750% * 80% = 600%
+		// CPU usage = cpu time / wall time, so the rate is: every 100ms, we can have 600ms cpu time,
+		// 600ms / 20ms = 30, or we can say: every 100ms, we can have 30 token generated.
+
+		now := time.Now()
+		elapse := now.Sub(lastTime)
+		lastTime = now
+
+		// refill tokens
+		refill := time.Duration(rate * float64(elapse))
+		tokens += refill
+		if tokens > capacity {
+			tokens = capacity
+		}
 
 		// == How to decide the priority of a task group? ==
 		// If a task group A is swap-in to the queue, and its last running time is [startA, endA], the corresponding cpu time is 20ms.
@@ -218,18 +275,29 @@ func Scheduler(opts ...Option) {
 
 		for !s.pq.Empty() {
 			if tokens < timeSlice {
-				// fmt.Println("sched really take effect", s.pq.Len(), "token:", tokens)
 				break
 			}
 
 			tg := s.pq.Dequeue()
-			cpuTime := time.Duration(atomic.LoadInt64(&tg.cpuTime))
-			tokens -= cpuTime
+			tg.version++
+
+			// Should it be `tokens - tg.cpuTime` here?
+			// tg.cpuTime may go beyond timeSlice, because the goroutines of the task group would not
+			// stop simultaneously, when one goroutine detected the timeSlice threshold,
+			// the others goroutines could still be running and consuming CPU until a CheckPoint is reached.
+			tokens -= timeSlice
+
+			output += timeSlice
+
 			tg.startTime = time.Now()
+
+			// fmt.Printf("%s dequeue = %p\n", tg.startTime, tg)
+
 			atomic.StoreInt64(&tg.cpuTime, 0)
 			tg.mu.Lock()
 			for tg.mu.tasks != nil {
 				tc := tg.mu.tasks
+				tc.version = tg.version
 				tg.mu.tasks = tg.mu.tasks.next
 				tc.next = nil
 				tc.wg.Done()
@@ -239,82 +307,42 @@ func Scheduler(opts ...Option) {
 	}
 }
 
-func refillTokensByLoad(refillCh chan<- time.Duration, timeSlice time.Duration, load float64) {
-	// A token bucket algorithm to limit the total cpu usage.
-	//
-	// When a task group enqueue, it means a 20ms cpu time elapsed,
-	// assume that the elapsed wall time is 100ms, it means the CPU usage is 20ms/100ms = 20%
-	// assume that the elapsed wall time is 20ms, it means the CPU usage is 20ms/20ms = 100%
-	// assume that the elapsed wall time is 5ms, it means the CPU usage is 20ms/5ms = 400%
-	// The last case can happen in a multi-core environment.
-	//
-	// == How to decide the token generate rate? ==
-	// Say, we want to control the CPU usage at 80%, there are 10 cores.
-	// GC takes 25% of CPU resource, reserve that for it, we have actually 750% available in total.
-	// 750% * 80% = 600%
-	// CPU usage = cpu time / wall time, so the rate is: every 100ms, we can have 600ms cpu time,
-	// 600ms / 20ms = 30, or we can say: every 100ms, we can have 30 token generated.
+type feedback struct {
+	elapse  time.Duration
+	cpuTime time.Duration
+}
 
-	lastWallClock := time.Now()
+// cpuLoadFeedback monitor the current CPU utilization as feedback for the mutator's rate.
+func cpuLoadFeedback(feedbackCh chan<- feedback, initRate float64) {
+	// linux kernel ticker work at 100Hz by default, so the same value (10ms) is choosed here.
+	// If the values is too large, the CPU load result for a period is accurate, but the rate feedback become dull.
+	// If the values is too small, I doubt the getProcessCPUTime() to be accurate. Because the implementation might
+	// choose reading /proc/{pid}/stat, and the later count the kernel's clock ticks.
 	ticker := time.NewTicker(10 * time.Millisecond)
+
 	lastSys, lastUsr := getProcessCPUTime()
-	totalReal, totalExpect := time.Duration(0), time.Duration(0)
-	expect := 10 * time.Millisecond
-	capacity := 10 * time.Duration(float64(time.Millisecond) * load)
+	lastWallClock := time.Now()
 	for i := 0; ; i++ {
 		now := <-ticker.C
-		sys,usr := getProcessCPUTime()
+
+		// Get the expected CPU utilization, it's 'elapsed wall clock' * 'expected rate'
+		elapse := now.Sub(lastWallClock)
+		lastWallClock = now
+
+		// Get the actual CPU utilization
+		sys, usr := getProcessCPUTime()
 		s := sys.Sub(lastSys)
 		u := usr.Sub(lastUsr)
 		lastSys = sys
 		lastUsr = usr
-		real := s + u
+		cpuTime := s + u
 
-		elapse := now.Sub(lastWallClock)
-		lastWallClock = now
-
-		max := time.Duration(float64(elapse) * load)
-		// expect := time.Duration(float64(elapse) * load)
-
-		totalReal += real
-		totalExpect += max
-		
-		delta := max - real
-		_ = delta
-		// refillCh <- delta
-		// refillCh <- time.Duration(float64(delta) * 0.5) + time.Duration(float64(expect) * 0.5)
-		// refillCh <- time.Duration(float64(delta) * 0.4) + time.Duration(float64(expect) * 0.6)
-		// refillCh <- time.Duration(float64(delta) * 0.25) + time.Duration(float64(expect) * 0.75)
-		// refillCh <- expect
-
-		if delta < 0 {
-			// expect = time.Duration(1.8 * float64(delta)) + expect
-			// refillCh <- time.Duration(1.8 * float64(delta)) + expect
-			// expect = time.Duration(1.5 * float64(delta)) + expect
-			// expect = time.Duration(1.2 * float64(delta)) + expect
-			expect += delta
-		} else {
-			expect += delta
-		}
-		if expect >= capacity {
-			expect = capacity
-		}
-
-		if expect < 0 {
-			fmt.Println("expect:", expect, "delta:", delta, "max:", max, "real:", real, "sys:", s, "usr:", u)
-		}
-
-		refillCh  <- expect
-
-		if i % 100 == 0 {
-			fmt.Println("totalReal:", totalReal, "totalExpect:", totalExpect)
-			totalReal = 0
-			totalExpect = 0
-		}
+		feedbackCh <- feedback{elapse, cpuTime}
 	}
 }
 
 func getProcessCPUTime() (time.Time, time.Time) {
+	// TODO: Support more platforms? Getrusage() is a linux API.
 	var r syscall.Rusage
 	err := syscall.Getrusage(syscall.RUSAGE_SELF, &r)
 	if err != nil {
@@ -386,11 +414,6 @@ func (pq *PriorityQueue) Pop() interface{} {
 	return ret
 }
 
-func (pq *PriorityQueue) Peek() *TaskGroup {
-	n := len(pq.data)
-	return pq.data[n-1]
-}
-
 func (pq *PriorityQueue) Enqueue(x *TaskGroup) {
 	heap.Push(pq, x)
 }
@@ -409,4 +432,3 @@ func (pq *PriorityQueue) Empty() bool {
 
 //go:linkname grunningnanos runtime.grunningnanos
 func grunningnanos() int64
-
