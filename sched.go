@@ -1,16 +1,16 @@
+// +build linux
+
 package sched
 
 import (
 	"container/heap"
 	"context"
-	// "fmt"
 	"runtime"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-	_ "unsafe"
 
 	_ "go.uber.org/automaxprocs"
 )
@@ -99,7 +99,7 @@ func Go(ctx context.Context, f func(ctx context.Context)) {
 // run out of its time slice. If so, the goroutine is yielded for scheduling.
 // The scheduler will wake up it according to the scheduling algorithm.
 func CheckPoint(ctx context.Context) {
-	if s.disabled.Load() == true {
+	if !supported() || s.disabled.Load() == true {
 		return
 	}
 
@@ -170,6 +170,10 @@ type Option func(*config)
 
 // Scheduler should run in a separate goroutine, and typically be called at the beginning of the process.
 func Scheduler(opts ...Option) {
+	if !supported() {
+		return
+	}
+
 	numCPU := runtime.GOMAXPROCS(0)
 	for _, opt := range opts {
 		opt(&s.cfg)
@@ -430,5 +434,3 @@ func (pq *PriorityQueue) Empty() bool {
 	return len(pq.data) == 0
 }
 
-//go:linkname grunningnanos runtime.grunningnanos
-func grunningnanos() int64
