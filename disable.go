@@ -1,3 +1,4 @@
+//go:build !sched
 // +build !sched
 
 package sched

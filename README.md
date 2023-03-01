@@ -18,7 +18,7 @@ Run the [demo/main.go](demo/main.go).
 
 ```
 cd demo
-go build
+go build -tags sched
 GOMAXPROCS=9 ./demo
 ```
 

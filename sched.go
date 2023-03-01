@@ -1,8 +1,10 @@
+//go:build linux
 // +build linux
 
 package sched
 
 import (
+	// "fmt"
 	"container/heap"
 	"context"
 	"runtime"
@@ -68,8 +70,7 @@ func NewTaskGroup(ctx context.Context) (context.Context, *TaskGroup) {
 // WithSchedInfo returns a new context with scheduling information attached.
 // When creating running a new goroutine from a task group, use this:
 //
-//	ctx := WithSchedInfo(ctx)
-//	go subTask(ctx)
+//	go f(sched.WithSchedInfo(ctx))
 func WithSchedInfo(ctx context.Context) context.Context {
 	tc := fromContext(ctx)
 	if tc == nil {
@@ -81,18 +82,6 @@ func WithSchedInfo(ctx context.Context) context.Context {
 	return context.WithValue(ctx, key, &TaskContext{
 		tg: tc.tg,
 	})
-}
-
-// Go runs f in a separate goroutine. It's the same with:
-//
-//	ctx := WithSchedInfo(ctx)
-//	go f(ctx)
-//
-// It's recommended to use this API rather than do above steps manually,
-// because one may forget to call WithSchedInfo.
-func Go(ctx context.Context, f func(ctx context.Context)) {
-	ctx = WithSchedInfo(ctx)
-	go f(ctx)
 }
 
 // CheckPoint should be called manually to check whether the goroutine (task group)
@@ -140,18 +129,18 @@ type config struct {
 type sched struct {
 	cfg        config
 	ch         chan *TaskContext
-	feedbackCh chan feedback
+	feedbackCh chan feedbackData
 	pq         *PriorityQueue
 	disabled   atomic.Bool
 }
 
 var s = sched{
 	ch:         make(chan *TaskContext, 8192),
-	feedbackCh: make(chan feedback, 100),
+	feedbackCh: make(chan feedbackData, 100),
 	pq:         newPriorityQueue(1024),
 	cfg: config{
 		timeSlice: 10 * time.Millisecond,
-		load:      0.8,
+		load:      1,
 	},
 }
 
@@ -184,13 +173,15 @@ func Scheduler(opts ...Option) {
 		capacity = timeSlice * time.Duration(numCPU)
 	}
 
+	var output time.Duration
 	// monitor the current CPU load to adjust the rate.
 	initRate := s.cfg.load * float64(numCPU)
 	go cpuLoadFeedback(s.feedbackCh, initRate)
-
-	var output time.Duration
-
 	rate := initRate
+	fb := feedback{
+		numCPU:   numCPU,
+		initRate: initRate,
+	}
 	tokens := capacity
 	lastTime := time.Now()
 	for i := 0; ; {
@@ -205,39 +196,20 @@ func Scheduler(opts ...Option) {
 					tg.mu.Unlock()
 					continue
 				}
-
 				s.pq.Enqueue(tg)
-				// fmt.Printf("!! enqueue by goroutine %p task group= %p, tc vec=%d, tg ver=%d\n", tc, tg, tc.version, tg.version)
-			} else {
-				// fmt.Printf("?? not enqueue, goroutine %p task group= %p, tc vec=%d, tg ver=%d\n", tc, tg, tc.version, tg.version)
 			}
 			tc.next = tg.mu.tasks
 			tg.mu.tasks = tc
 			tg.mu.Unlock()
-		case fb := <-s.feedbackCh:
-			// The expected cpu time = load * numCPU * elapsed wall clock
-			expectCPUTime := initRate * float64(fb.elapse)
-			// delta is the difference between expected cpu time and actual cpu time
-			// delta can be a positive or a negative, positive means the CPU utilization is underloaded
-			// negative means the CPU utilization is overload
-			delta := expectCPUTime - float64(fb.cpuTime)
-			// delta / the period is used as feedback for the rate.
-			rateDelta := float64(delta) / float64(fb.elapse+10*time.Millisecond)
-			rate += rateDelta
-			i++
+		case data := <-s.feedbackCh:
+			// Adjust the rate according to the feedback algorithm.
+			rate = feedbackAlgorithm(&fb, rate, data)
+
 			if i%100 == 0 {
-				// fmt.Println("rate:", rate, "tokens:", tokens, "initRate:", initRate, "output:", output)
+				// fmt.Println("rate:", rate, "output:", output)
 				output = 0
 			}
-			// set a upper bound for the rate
-			// If there is no upper bound for the rate, it goes to +INF when the workload can't
-			// make the CPU utilization full. And +INF for rate does not make sense in that case.
-			if rate > 2*initRate {
-				rate = 2 * initRate
-			}
-			if rate < 0 {
-				rate = 0
-			}
+			i++
 		}
 
 		// A token bucket algorithm to limit the total cpu usage.
@@ -279,6 +251,7 @@ func Scheduler(opts ...Option) {
 
 		for !s.pq.Empty() {
 			if tokens < timeSlice {
+				// fmt.Println("queue len==", s.pq.Len(), "rate:", rate)
 				break
 			}
 
@@ -290,12 +263,8 @@ func Scheduler(opts ...Option) {
 			// stop simultaneously, when one goroutine detected the timeSlice threshold,
 			// the others goroutines could still be running and consuming CPU until a CheckPoint is reached.
 			tokens -= timeSlice
-
-			output += timeSlice
-
 			tg.startTime = time.Now()
-
-			// fmt.Printf("%s dequeue = %p\n", tg.startTime, tg)
+			output += timeSlice
 
 			atomic.StoreInt64(&tg.cpuTime, 0)
 			tg.mu.Lock()
@@ -311,13 +280,99 @@ func Scheduler(opts ...Option) {
 	}
 }
 
-type feedback struct {
+type feedbackData struct {
 	elapse  time.Duration
 	cpuTime time.Duration
 }
 
+type feedbackPhase int64
+
+const (
+	Stable feedbackPhase = iota
+	Idle
+	Busy
+	GC
+)
+
+type feedback struct {
+	numCPU   int
+	initRate float64
+	phase    feedbackPhase
+	count    int
+	rateAVG  float64
+}
+
+func feedbackAlgorithm(f *feedback, rate float64, fb feedbackData) float64 {
+	// The feedback algorithm works mainly by switching between two phases:
+	//     1. feedback by the load -- Idle
+	//     2. decrease the rate a bit when the load is saturated -- Busy
+	// There are yet another two phases: Stable and GC
+	// The rate will be adjusted between Idle and Busy to make it located in the Stable phase.
+	// In Stable phase, the rate is not adjusted.
+	// When Go do the garbage collection, the workload is totally different, so there is a GC phase.
+	usage := float64(fb.cpuTime) / (float64(fb.elapse) * float64(f.numCPU))
+	// The ticker default to 10ms, when the program is too busy, the ticker become unstable.
+	tickerStable := fb.elapse > 8*time.Millisecond && fb.elapse < 12*time.Millisecond
+
+	if usage < 0.8 && tickerStable { // Idle phase
+		// The expected cpu time = numCPU * elapsed wall clock
+		expectCPUTime := f.initRate * float64(fb.elapse)
+		// delta is the difference between expected cpu time and actual cpu time
+		delta := expectCPUTime - float64(fb.cpuTime)
+		// delta / the period duration is used as feedback for the rate.
+		rateDelta := float64(delta) / float64(fb.elapse+10*time.Millisecond)
+		rate += rateDelta
+		// fmt.Println("rate:", rate, "usage:", usage, "elapse:", fb.elapse)
+		f.phase = Idle
+	} else if usage > 0.96 { // Busy phase
+		// When the load is saturated, feedback the rate by the load does not work well.
+		// Just turn down the rate a bit, to see does the load turn down as well.
+		// If if become Idle again, the Idle phase feedback would increase the rate.
+		// The ultimate goal is make rate to the Stable phase.
+		if rate > f.rateAVG*0.7 {
+			// fmt.Println("irate:", rate, "after:", rate * 0.96, "usage:", usage, "elapse:", fb.elapse)
+			rate = rate * 0.96
+			f.phase = Busy
+		} else {
+			// There is a **fake** busy condition: when Go GC, the load is high
+			// If we turn down the rate, the Go runtime would take the idle CPU resource to assist GC
+			// This is not what I want, so just keep the rate to 70% of the average when Go is not GC
+			rate = f.rateAVG * 0.7
+			f.phase = GC
+		}
+	} else { // Stable phase
+		// Calculate the average rate when switching from Idle -> Stable phase
+		// This value can be seen as the comfort zone for the rate when Go is not GCing.
+		if f.phase == Idle {
+			if f.count == 0 {
+				f.rateAVG = rate
+			} else {
+				f.rateAVG = f.rateAVG*float64(f.count)/float64(f.count+1) +
+					rate/float64(f.count+1)
+			}
+			f.count++
+			// fmt.Println("keep rate?", rate, "usage:", usage, "elapse:", fb.elapse, "rateAVG:", f.rateAVG)
+		}
+		f.phase = Stable
+	}
+
+	// set a upper/lower bound for the rate
+	// If there is no upper bound for the rate, it goes to +INF when the workload can't
+	// make the CPU utilization full. And +INF for rate does not make sense in that case.
+	if rate > f.initRate {
+		rate = f.initRate
+	}
+	if rate < 0 {
+		rate = 0
+	}
+	// if rate < f.rateAVG * 0.7 {
+	// 	fmt.Println("low rate?", rate, "usage:", usage, "elapse:", fb.elapse, "rateAVG:", f.rateAVG)
+	// }
+	return rate
+}
+
 // cpuLoadFeedback monitor the current CPU utilization as feedback for the mutator's rate.
-func cpuLoadFeedback(feedbackCh chan<- feedback, initRate float64) {
+func cpuLoadFeedback(feedbackCh chan<- feedbackData, initRate float64) {
 	// linux kernel ticker work at 100Hz by default, so the same value (10ms) is choosed here.
 	// If the values is too large, the CPU load result for a period is accurate, but the rate feedback become dull.
 	// If the values is too small, I doubt the getProcessCPUTime() to be accurate. Because the implementation might
@@ -341,7 +396,7 @@ func cpuLoadFeedback(feedbackCh chan<- feedback, initRate float64) {
 		lastUsr = usr
 		cpuTime := s + u
 
-		feedbackCh <- feedback{elapse, cpuTime}
+		feedbackCh <- feedbackData{elapse, cpuTime}
 	}
 }
 
@@ -362,13 +417,6 @@ func getProcessCPUTime() (time.Time, time.Time) {
 func TimeSliceOption(v time.Duration) Option {
 	return func(c *config) {
 		c.timeSlice = v
-	}
-}
-
-// LoadOption controls the `load` of the CPU usage, default to 0.8 (80%)
-func LoadOption(v float64) Option {
-	return func(c *config) {
-		c.load = v
 	}
 }
 
@@ -433,4 +481,3 @@ func (pq *PriorityQueue) Full() bool {
 func (pq *PriorityQueue) Empty() bool {
 	return len(pq.data) == 0
 }
-

@@ -69,31 +69,30 @@ func allocIntensiveTask(m map[int][]byte, ctx context.Context) {
 }
 
 func TestT(t *testing.T) {
-	// go Scheduler(LoadOption(0.50), TimeSliceOption(10*time.Millisecond))
-	go Scheduler(LoadOption(0.8), TimeSliceOption(10*time.Millisecond))
+	go Scheduler(TimeSliceOption(10 * time.Millisecond))
 	for i := 0; i < 12; i++ {
 		ctx, _ := NewTaskGroup(context.Background())
 		switch i % 3 {
 		case 0:
-			Go(ctx, func(ctx context.Context) {
+			go func(ctx context.Context) {
 				for {
 					cpuIntensiveTask(ctx)
 				}
-			})
+			}(WithSchedInfo(ctx))
 		case 1:
-			Go(ctx, func(ctx context.Context) {
+			go func(ctx context.Context) {
 				m := make(map[int][]byte)
 				for {
 					allocIntensiveTask(m, ctx)
 				}
-			})
+			}(WithSchedInfo(ctx))
 		case 2:
-			Go(ctx, func(ctx context.Context) {
+			go func(ctx context.Context) {
 				for {
 					m := make(map[int][]byte)
 					allocIntensiveTask(m, ctx)
 				}
-			})
+			}(WithSchedInfo(ctx))
 		}
 	}
 	go untracked()
