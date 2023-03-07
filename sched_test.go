@@ -207,3 +207,32 @@ func getCPUTime() (userTimeMillis, sysTimeMillis int64, err error) {
 func strtoull(val string) (uint64, error) {
 	return strconv.ParseUint(val, 10, 64)
 }
+
+func task1(ctx context.Context) {
+	for {
+		cpuIntensiveTask(ctx)
+	}
+}
+
+func task2(ctx context.Context) {
+	for {
+		cpuIntensiveTask(ctx)
+	}
+}
+
+func TestPriority(t *testing.T) {
+	go Scheduler(WeightedOption(true))
+	for i := 0; i < 12; i++ {
+		switch i % 2 {
+		case 0:
+			ctx1, tg1 := NewTaskGroup(context.Background())
+			tg1.SetWeight(1)
+			go task1(WithSchedInfo(ctx1))
+		case 1:
+			ctx2, tg2 := NewTaskGroup(context.Background())
+			tg2.SetWeight(0.5)
+			go task2(WithSchedInfo(ctx2))
+		}
+	}
+	http.ListenAndServe(":10080", nil)
+}

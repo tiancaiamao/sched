@@ -20,6 +20,7 @@ import (
 type TaskGroup struct {
 	cpuTime   int64
 	startTime time.Time
+	weight    float64
 
 	// All task context (goroutine) in this task group is yield and maintained in a link list
 	mu struct {
@@ -29,6 +30,11 @@ type TaskGroup struct {
 	version uint64
 }
 
+// SetWeight can set the weight of this task group if the scheduler is configured to weighted.
+func (tg *TaskGroup) SetWeight(w float64) {
+	tg.weight = w
+}
+
 type TaskContext struct {
 	tg        *TaskGroup
 	wg        sync.WaitGroup
@@ -36,6 +42,37 @@ type TaskContext struct {
 	next      *TaskContext
 	version   uint64
 }
+
+// type startTimeHistory struct {
+// 	queue [5]time.Time
+// 	pos int
+// 	len int
+// }
+
+// func (sth *startTimeHistory) startTime() time.Time {
+// 	last := (sth.pos + len(sth.queue) - 1) % len(sth.queue)
+// 	return sth.queue[last]
+// }
+
+// func (sth *startTimeHistory) add(t time.Time) {
+// 	sth.queue[sth.pos] = t
+// 	sth.pos = (sth.pos + 1) % len(sth.queue)
+// 	sth.len++
+// 	if sth.len >= len(sth.queue) {
+// 		sth.len = len(sth.queue)
+// 	}
+// }
+
+// func (sth *startTimeHistory) usage() float64 {
+// 	if sth.len < 2 {
+// 		dur := time.Now().Sub(sth.startTime())
+// 		return float64(s.cfg.timeSlice) / float64(dur)
+// 	}
+// 	firstPos := (sth.pos + len(sth.queue) - sth.len) % len(sth.queue)
+// 	oldest := sth.queue[firstPos]
+// 	dur := sth.startTime().Sub(oldest)
+// 	return float64(sth.len-1) * float64(s.cfg.timeSlice) / float64(dur)
+// }
 
 type keyType int
 
@@ -59,9 +96,9 @@ func fromContext(ctx context.Context) *TaskContext {
 // A task group is a scheduling unit consist of a group of goroutines.
 // The necessary information for scheduling is embeded in the context.Context.
 func NewTaskGroup(ctx context.Context) (context.Context, *TaskGroup) {
-	tg := &TaskGroup{
-		startTime: time.Now(),
-	}
+	tg := &TaskGroup{}
+	tg.weight = 1.0
+	tg.startTime = time.Now()
 	return context.WithValue(ctx, key, &TaskContext{
 		tg: tg,
 	}), tg
@@ -122,8 +159,9 @@ func CheckPoint(ctx context.Context) {
 
 type config struct {
 	timeSlice time.Duration
-	load      float64
 	capacity  time.Duration
+	load      float64
+	weighted  bool
 }
 
 type sched struct {
@@ -420,11 +458,25 @@ func TimeSliceOption(v time.Duration) Option {
 	}
 }
 
+// LoadOption controls the `load` of the CPU usage, default to 1
+func LoadOption(v float64) Option {
+	return func(c *config) {
+		c.load = v
+	}
+}
+
 // CapacityOption controls the token bucket capacity, which controls the burst behaviour.
 // Default value is GOMAXPROCS * time slice, DONOT SET IT TO 0
 func CapacityOption(v time.Duration) Option {
 	return func(c *config) {
 		c.capacity = v
+	}
+}
+
+// WeightedOption make the scheduling support weighted task group, rather than regarding as all equal.
+func WeightedOption(v bool) Option {
+	return func(c *config) {
+		c.weighted = v
 	}
 }
 
@@ -448,6 +500,11 @@ func (pq *PriorityQueue) Len() int {
 func (pq *PriorityQueue) Less(i, j int) bool {
 	di := pq.data[i]
 	dj := pq.data[j]
+	now := time.Now()
+	if s.cfg.weighted {
+		return (float64(s.cfg.timeSlice)/float64(now.Sub(di.startTime)))*di.weight <
+			(float64(s.cfg.timeSlice)/float64(now.Sub(dj.startTime)))*dj.weight
+	}
 	return di.startTime.Before(dj.startTime)
 }
 
