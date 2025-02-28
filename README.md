@@ -2,8 +2,7 @@
 
 Go runtime has no priority-based scheduling (barely FIFO), the scheduling latency is a big problem for some real-time task.
 
-See a blog post (Chinese) https://www.zenlife.tk/go-manual-scheduler.md
-
+See a blog post (Chinese) https://ns1.hns.to/go-manual-scheduler.md
 ## Prerequisites 
 
 Need to patch the Go https://github.com/golang/go/pull/51347
